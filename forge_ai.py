@@ -15,7 +15,22 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 import uvicorn
 from pydantic import BaseModel
-from anthropic import Anthropic
+
+try:
+    from anthropic import Anthropic
+except ImportError:
+    class Anthropic:
+        """Fallback Anthropic client stub when the package is unavailable."""
+
+        class messages:
+            @staticmethod
+            def create(*args, **kwargs):
+                class Response:
+                    def __init__(self):
+                        content_item = type("ContentItem", (), {"text": "Anthropic client unavailable. Install the 'anthropic' package to enable AI features."})
+                        self.content = [content_item]
+
+                return Response()
 
 # ============================================================================
 # FEATURE 1: PERSISTENT MEMORY SYSTEM (Vector-like embedding storage)
