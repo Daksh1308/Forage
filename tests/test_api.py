@@ -73,3 +73,12 @@ def test_worker_stats(client):
     data = response.json()
     assert "online_workers" in data
     assert "completed_tasks" in data
+
+
+def test_worker_heartbeat(client):
+    client.post("/workers/register", json={"worker_id": "hb-worker"})
+    response = client.post("/workers/heartbeat", json={"worker_id": "hb-worker"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "online"
+    assert data["worker_id"] == "hb-worker"

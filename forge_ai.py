@@ -10,8 +10,9 @@ import os
 import json
 import sqlite3
 import logging
+import asyncio
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 import uvicorn
@@ -444,15 +445,102 @@ class TaskQueue:
             "active_workers": list(self.active_workers.keys())
         }
 
+    def record_heartbeat(self, worker_id: str):
+        """Record a heartbeat from a worker, marking them online."""
+        c = self.conn.cursor()
+        now = datetime.now().isoformat()
+        c.execute('''UPDATE workers SET status = ?, last_heartbeat = ? WHERE worker_id = ?''',
+                  ('online', now, worker_id))
+        if c.rowcount == 0:
+            c.execute('''INSERT INTO workers (worker_id, status, last_heartbeat, tasks_completed)
+                        VALUES (?, ?, ?, 0)''',
+                     (worker_id, 'online', now))
+        self.conn.commit()
+        self.active_workers[worker_id] = True
+        log.info("Heartbeat recorded for worker '%s'", worker_id)
+
+    def mark_workers_offline(self, stale_threshold_seconds: int = 60):
+        """Mark workers as offline if their heartbeat is older than the threshold.
+
+        Returns the list of worker IDs that were marked offline.
+        """
+        c = self.conn.cursor()
+        threshold = (datetime.now() - timedelta(seconds=stale_threshold_seconds)).isoformat()
+        c.execute('''UPDATE workers SET status = ? WHERE status = ? AND last_heartbeat < ?''',
+                  ('offline', 'online', threshold))
+        affected = c.fetchone() if c.description else None
+        self.conn.commit()
+        log.info("Marked workers offline (threshold=%ss)", stale_threshold_seconds)
+        return self._get_recently_offline_workers(threshold)
+
+    def _get_recently_offline_workers(self, threshold: str) -> list:
+        """Get workers that were just marked offline within this cycle."""
+        c = self.conn.cursor()
+        c.execute('''SELECT worker_id FROM workers WHERE status = ? AND last_heartbeat < ?''',
+                  ('offline', threshold))
+        workers = [row[0] for row in c.fetchall()]
+        for w in workers:
+            self.active_workers.pop(w, None)
+        return workers
+
+    def reassign_orphaned_tasks(self, stale_threshold_seconds: int = 60) -> int:
+        """Reassign tasks that were assigned to workers who went offline.
+
+        Returns the number of tasks reassigned.
+        """
+        c = self.conn.cursor()
+        threshold = (datetime.now() - timedelta(seconds=stale_threshold_seconds)).isoformat()
+        c.execute('''UPDATE tasks SET status = ?, assigned_to = NULL, completed_at = NULL
+                     WHERE status = ? AND assigned_to IN (
+                         SELECT worker_id FROM workers
+                         WHERE status = ? AND last_heartbeat < ?
+                     )''',
+                  ('pending', 'assigned', 'offline', threshold))
+        self.conn.commit()
+        count = c.rowcount
+        if count > 0:
+            log.info("Reassigned %d orphaned tasks back to pending", count)
+        return count
+
+    def run_maintenance(self, stale_threshold_seconds: int = 60):
+        """Run all maintenance tasks: detect stale workers and reassign orphaned tasks."""
+        self.mark_workers_offline(stale_threshold_seconds)
+        self.reassign_orphaned_tasks(stale_threshold_seconds)
+
 # ============================================================================
 # LIFESPAN (startup / shutdown)
 # ============================================================================
 
+# ---------------------------------------------------------------------------
+# Background maintenance: detect stale workers, reassign orphaned tasks
+# ---------------------------------------------------------------------------
+
+_stop_event = asyncio.Event()
+
+async def maintenance_loop(interval_seconds: int = 30, stale_threshold: int = 60):
+    """Periodically detect stale workers and reassign orphaned tasks."""
+    log.info("Maintenance loop started (interval=%ss, stale_threshold=%ss)", interval_seconds, stale_threshold)
+    try:
+        while not _stop_event.is_set():
+            await asyncio.sleep(interval_seconds)
+            task_queue.run_maintenance(stale_threshold)
+    except asyncio.CancelledError:
+        log.info("Maintenance loop cancelled")
+    except Exception as e:
+        log.error("Maintenance loop error: %s", e)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Forge AGI starting up")
+    task = asyncio.create_task(maintenance_loop())
     yield
     log.info("Forge AGI shutting down — closing database connections")
+    _stop_event.set()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
     memory.close()
     task_queue.close()
 
@@ -600,6 +688,13 @@ async def register_worker(worker: WorkerRegistration):
         "pending_tasks": task_queue.get_pending_tasks(5)
     }
 
+@app.post("/workers/heartbeat")
+async def worker_heartbeat(worker: WorkerRegistration):
+    """Record a heartbeat from a worker to keep it marked online."""
+    log.info("API: heartbeat from worker '%s'", worker.worker_id)
+    task_queue.record_heartbeat(worker.worker_id)
+    return {"worker_id": worker.worker_id, "status": "online", "timestamp": datetime.now().isoformat()}
+
 @app.get("/workers/stats")
 async def get_worker_stats():
     """Get cluster statistics"""
@@ -640,6 +735,7 @@ async def root():
             },
             "workers": {
                 "POST /workers/register": "Register a compute worker",
+                "POST /workers/heartbeat": "Send heartbeat to stay online",
                 "GET /workers/stats": "Get cluster statistics",
                 "GET /tasks/pending": "Get pending tasks",
                 "POST /tasks/{task_id}/complete": "Mark task complete"

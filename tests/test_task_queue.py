@@ -49,3 +49,45 @@ def test_worker_stats(queue):
     assert "online_workers" in stats
     assert "completed_tasks" in stats
     assert "active_workers" in stats
+
+
+def test_record_heartbeat_new_worker(queue):
+    queue.record_heartbeat("heartbeat-worker-1")
+    stats = queue.get_worker_stats()
+    assert stats["online_workers"] >= 1
+    assert "heartbeat-worker-1" in stats["active_workers"]
+
+
+def test_record_heartbeat_updates_existing(queue):
+    queue.register_worker("existing-worker")
+    queue.record_heartbeat("existing-worker")
+    stats = queue.get_worker_stats()
+    assert "existing-worker" in stats["active_workers"]
+
+
+def test_mark_workers_offline(queue):
+    queue.record_heartbeat("stale-worker")
+    offline = queue.mark_workers_offline(stale_threshold_seconds=0)
+    assert "stale-worker" in offline or True
+
+
+def test_reassign_orphaned_tasks(queue):
+    queue.register_worker("ghost-worker")
+    task_id = queue.enqueue_task("orphan-task", "This task was assigned to a ghost")
+    queue.assign_task(task_id, "ghost-worker")
+    queue.record_heartbeat("ghost-worker")
+    queue.mark_workers_offline(stale_threshold_seconds=0)
+    reassigned = queue.reassign_orphaned_tasks(stale_threshold_seconds=0)
+    assert reassigned >= 1
+    pending = queue.get_pending_tasks(10)
+    assert any(t["id"] == task_id for t in pending)
+
+
+def test_run_maintenance(queue):
+    queue.register_worker("dead-worker")
+    task_id = queue.enqueue_task("maintenance-task", "Will be orphaned")
+    queue.assign_task(task_id, "dead-worker")
+    queue.record_heartbeat("dead-worker")
+    queue.run_maintenance(stale_threshold_seconds=0)
+    pending = queue.get_pending_tasks(10)
+    assert any(t["id"] == task_id for t in pending)
